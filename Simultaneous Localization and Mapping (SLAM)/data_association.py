@@ -2,7 +2,6 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from abc import ABC, abstractmethod
 from scipy.spatial import distance
 import pandas as pd
 
@@ -96,6 +95,18 @@ def get_measurements(pos: np.ndarray, heading: float) -> np.ndarray:
     return local + np.random.normal(0, NOISE_STD, local.shape)
 
 
+def step_kinematic(pos: np.ndarray, heading: float,
+                   velocity: float, steering: float):
+    """One bicycle-model step; returns (new_pos, new_heading)."""
+    new_pos = pos.copy()
+    new_pos[0] += velocity * np.cos(heading) * DT
+    new_pos[1] += velocity * np.sin(heading) * DT
+    new_heading = angle_wrap(
+        heading + (velocity / WHEELBASE) * np.tan(steering) * DT
+    )
+    return new_pos, new_heading
+
+
 def draw_track(ax, alpha_b: float = 0.4, alpha_y: float = 0.4) -> None:
     ax.scatter(BLUE_CONES[:, 0],   BLUE_CONES[:, 1],
                c="royalblue", marker="^", s=65,  alpha=alpha_b,
@@ -125,19 +136,19 @@ def setup_ax(ax, subtitle: str = "") -> None:
 
 
 # ── Abstract Base ─────────────────────────────────────────────────────────────
-class Bot(ABC):
+class Bot:
     def __init__(self):
         self.pos     = CAR_START_POS.copy()   # (2,) float64
         self.heading = CAR_START_HEADING      # radians
 
-    @abstractmethod
-    def data_association(self, measurements, current_map): ...
+    def data_association(self, measurements, current_map):
+        raise NotImplementedError
 
-    @abstractmethod
-    def localization(self, velocity, steering): ...
+    def localization(self, velocity, steering):
+        raise NotImplementedError
 
-    @abstractmethod
-    def mapping(self, measurements): ...
+    def mapping(self, measurements):
+        raise NotImplementedError
 
 
 # ──  Solution ──────────────────────────────────────────────────────────
@@ -170,35 +181,6 @@ class Solution(Bot):
         self._assoc = np.argmin(D, axis=1)
         return self._assoc
 
-    # ------------------------------------------------------------------
-    def localization(self, velocity, steering):
-        """
-        Bicycle kinematic model (dead reckoning):
-            ẋ = v·cos(ψ)
-            ẏ = v·sin(ψ)
-            ψ̇ = (v / L)·tan(δ)
-        """
-        self.pos[0]  += velocity * np.cos(self.heading) * DT
-        self.pos[1]  += velocity * np.sin(self.heading) * DT
-        self.heading  = angle_wrap(
-            self.heading + (velocity / WHEELBASE) * np.tan(steering) * DT
-        )
-
-    # ------------------------------------------------------------------
-    def mapping(self, measurements):
-        """
-        Transform local measurements to world frame and accumulate unique
-        landmark estimates (distance-threshold deduplication).
-        """
-        if len(measurements) == 0:
-            return
-        gm = local_to_global(measurements, self.pos, self.heading)
-        for p in gm:
-            if not self.learned_map or \
-               min(np.linalg.norm(p - q) for q in self.learned_map) > 2.0:
-                self.learned_map.append(p.copy())
-
-
 # ── Problem 1 – Data Association ──────────────────────────────────────────────
 def make_problem1():
     """
@@ -216,7 +198,7 @@ def make_problem1():
         steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
         meas  = get_measurements(sol.pos, sol.heading)
         sol.data_association(meas, MAP_CONES)
-        sol.localization(SPEED, steer)
+        sol.pos, sol.heading = step_kinematic(sol.pos, sol.heading, SPEED, steer)
 
         draw_track(ax)
 
@@ -238,80 +220,6 @@ def make_problem1():
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
     return fig, ani
 
-
-# ── Problem 2 – Localization ───────────────────────────────────────────────────
-def make_problem2():
-    """
-    Visualise dead-reckoning: the magenta trail is the car's estimated
-    trajectory built purely from the kinematic model and steering commands.
-    """
-    sol     = Solution()
-    path_x  = [float(sol.pos[0])]
-    path_y  = [float(sol.pos[1])]
-    fig, ax = plt.subplots(figsize=(10, 7))
-    fig.suptitle("Problem 2 – Localization  (Dead Reckoning / Kinematic Model)",
-                 fontsize=13, fontweight="bold")
-
-    def update(frame):
-        ax.clear()
-        steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        sol.localization(SPEED, steer)
-        path_x.append(float(sol.pos[0]))
-        path_y.append(float(sol.pos[1]))
-
-        draw_track(ax)
-        ax.plot(path_x, path_y, color="magenta", lw=2.0,
-                alpha=0.85, zorder=4, label="Dead-reckoning path")
-        draw_car(ax, sol.pos, sol.heading)
-        setup_ax(ax,
-            f"Frame {frame+1}/{N_FRAMES}  –  "
-            f"pos=({sol.pos[0]:.1f}, {sol.pos[1]:.1f})  "
-            f"ψ={np.degrees(sol.heading):.1f}°")
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-
-    ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
-    return fig, ani
-
-
-# ── Problem 3 – Mapping ───────────────────────────────────────────────────────
-def make_problem3():
-    """
-    Visualise incremental mapping: green × marks show the car's accumulated
-    global cone map built from local sensor measurements.  Ground-truth cones
-    are faded so the learned map stands out.
-    """
-    sol = Solution()
-    fig, ax = plt.subplots(figsize=(10, 7))
-    fig.suptitle("Problem 3 – Mapping  (Local → Global Transform + Deduplication)",
-                 fontsize=13, fontweight="bold")
-
-    def update(frame):
-        ax.clear()
-        steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        meas  = get_measurements(sol.pos, sol.heading)
-        sol.localization(SPEED, steer)
-        sol.mapping(meas)
-
-        draw_track(ax, alpha_b=0.15, alpha_y=0.15)
-
-        if sol.learned_map:
-            lm = np.array(sol.learned_map)
-            ax.scatter(lm[:, 0], lm[:, 1],
-                       c="limegreen", marker="x", s=90, linewidths=2.0,
-                       zorder=5, label=f"Mapped cones ({len(lm)})")
-
-        draw_car(ax, sol.pos, sol.heading)
-        setup_ax(ax,
-            f"Frame {frame+1}/{N_FRAMES}  –  "
-            f"map size: {len(sol.learned_map)} / {len(MAP_CONES)} cones")
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-
-    ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
-    return fig, ani
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=== Driverless Car Hackathon – SLAM Visualisation ===")
@@ -321,11 +229,9 @@ if __name__ == "__main__":
     print(f"  Car start    : {CAR_START_POS}  "
           f"heading={np.degrees(CAR_START_HEADING):.1f}°")
     print(f"  Centerline   : {len(CENTERLINE)} waypoints (clockwise)")
-    print("\nOpening 3 animation windows …")
+    print("\nOpening 1 animation window …")
 
     # Keep references to prevent garbage collection of FuncAnimation objects.
     fig1, ani1 = make_problem1()
-    fig2, ani2 = make_problem2()
-    fig3, ani3 = make_problem3()
 
     plt.show()
