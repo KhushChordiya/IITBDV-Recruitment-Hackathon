@@ -1,8 +1,6 @@
 #  Simulation Development Hackathon — Problem Statement
 
 > **Build your own physics simulation for a robot from scratch.**
-> No physics engines. No shortcuts. Just **you, math, and code**.
-
 ---
 
 ## Table of Contents
