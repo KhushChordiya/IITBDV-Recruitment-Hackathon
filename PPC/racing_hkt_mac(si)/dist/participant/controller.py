@@ -42,7 +42,7 @@ def throttle_algorithm(target_speed, current_speed, dt):
     throttle = 0
     brake = 0.0
     # clip throttle and brake to [0, 1]
-    return np.clip(output, 0.0, 1.0), np.clip(brake, 0.0, 1.0)
+    return np.clip(throttle, 0.0, 1.0), np.clip(brake, 0.0, 1.0)
 
 def control(
     path: list[dict],
