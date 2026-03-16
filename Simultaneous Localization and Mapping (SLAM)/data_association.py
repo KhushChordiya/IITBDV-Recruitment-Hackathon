@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.spatial import distance
+from scipy.optimize import linear_sum_assignment   # ← Hungarian algorithm
 import pandas as pd
 
 # ── Load Track from CSV ───────────────────────────────────────────────────────
@@ -47,6 +48,11 @@ DT           = 0.1    # seconds – time step
 SPEED        = 7.0    # m/s
 LOOKAHEAD    = 5.5    # pure-pursuit lookahead distance (m)
 N_FRAMES     = 130    # ≈ one full lap
+
+# ── Data-Association Configuration ───────────────────────────────────────────
+CHI2_GATE_95_2DOF = 5.991   # 95th-percentile chi-squared, 2 degrees of freedom
+LARGE_COST        = 1e9     # sentinel cost for gated-out pairs
+MEAS_COV          = np.eye(2) * (NOISE_STD ** 2)  # measurement noise covariance
 
 
 # ── Utility Functions ─────────────────────────────────────────────────────────
@@ -157,40 +163,96 @@ class Solution(Bot):
         super().__init__()
         self.learned_map  = []                    # list of np.ndarray (2,)
         # Internal state exposed for visualisation
-        self._global_meas = np.zeros((0, 2))
-        self._assoc       = np.array([], dtype=int)
+        self._global_meas   = np.zeros((0, 2))
+        self._assoc         = np.array([], dtype=int)
+        self._unmatched_meas = np.zeros((0, 2))   # NEW: store gated-out measurements
 
     # ------------------------------------------------------------------
     def data_association(self, measurements, current_map):
         """
-        Nearest-Neighbour data association.
-        Steps:
-          1. Transform local measurements → world frame using current pose.
-          2. For each measurement find the nearest cone in *current_map*.
-        Returns an int array of indices into current_map.
+        Improved data association using:
+          1. Mahalanobis-distance gating  – rejects implausible matches before
+             assignment, using chi-squared 95th-percentile threshold (2-DOF).
+          2. Hungarian algorithm (linear_sum_assignment) – globally optimal
+             1-to-1 matching instead of greedy nearest-neighbour, which can
+             chain-cascade bad assignments when cones are close together.
+          3. Outlier handling – unmatched measurements (outside the gate) are
+             stored in self._unmatched_meas for visualisation and potential
+             new-landmark initialisation.
+
+        Parameters
+        ----------
+        measurements : np.ndarray (M, 2)  –  cone observations in LOCAL frame
+        current_map  : np.ndarray (L, 2)  –  known cone positions in WORLD frame
+
+        Returns
+        -------
+        assoc : np.ndarray (M,) int
+            Index into current_map for each measurement.
+            Unmatched measurements receive index -1.
         """
+        # ── Reset visualisation state ──────────────────────────────────
+        self._global_meas    = np.zeros((0, 2))
+        self._assoc          = np.array([], dtype=int)
+        self._unmatched_meas = np.zeros((0, 2))
+
         if len(measurements) == 0 or len(current_map) == 0:
-            self._global_meas = np.zeros((0, 2))
-            self._assoc       = np.array([], dtype=int)
             return self._assoc
 
+        # ── 1. Transform measurements from local → global frame ────────
         gm = local_to_global(measurements, self.pos, self.heading)
-        self._global_meas = gm
+        self._global_meas = gm                    # store for visualisation
 
-        D           = distance.cdist(gm, current_map)
-        self._assoc = np.argmin(D, axis=1)
+        M = len(gm)
+        L = len(current_map)
+
+        # ── 2. Build Mahalanobis cost matrix (M × L) ──────────────────
+        # current_map is an (L, 2) array here (MAP_CONES), so no 'cov' key.
+        # We use the known sensor noise covariance as the innovation cov.
+        cost = np.full((M, L), LARGE_COST)
+        S_inv = np.linalg.inv(MEAS_COV)           # constant since no landmark cov
+
+        for i, meas in enumerate(gm):
+            diffs = current_map - meas             # (L, 2) broadcast
+            # Vectorised Mahalanobis: d²ᵢⱼ = diffᵀ S⁻¹ diff
+            maha2 = np.einsum("lj,jk,lk->l", diffs, S_inv, diffs)  # (L,)
+            within_gate = maha2 < CHI2_GATE_95_2DOF
+            cost[i, within_gate] = maha2[within_gate]
+
+        # ── 3. Hungarian assignment on gated cost matrix ───────────────
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        # Build output array: -1 for unmatched measurements
+        assoc_out = np.full(M, -1, dtype=int)
+        matched   = set()
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < LARGE_COST:            # valid (non-sentinel) pair
+                assoc_out[r] = c
+                matched.add(r)
+
+        # ── 4. Store unmatched measurements for visualisation ──────────
+        unmatched_idx = [i for i in range(M) if i not in matched]
+        if unmatched_idx:
+            self._unmatched_meas = gm[unmatched_idx]
+
+        self._assoc = assoc_out
         return self._assoc
+
 
 # ── Problem 1 – Data Association ──────────────────────────────────────────────
 def make_problem1():
     """
-    Visualise nearest-neighbour association: cyan dots = sensor measurements
-    transformed to world frame; green dashed lines connect each measurement
-    to its matched map cone.
+    Visualise improved data association.
+
+    Colour coding:
+      cyan  dots  = measurements matched via Hungarian + Mahalanobis gating
+      green dashes = association line to the assigned map cone
+      red   dots  = measurements rejected by the Mahalanobis gate (outliers /
+                    new-landmark candidates) – shown WITHOUT an association line
     """
     sol = Solution()
     fig, ax = plt.subplots(figsize=(10, 7))
-    fig.suptitle("Problem 1 – Data Association  (Nearest Neighbour)",
+    fig.suptitle("Problem 1 – Data Association  (Hungarian + Mahalanobis Gate)",
                  fontsize=13, fontweight="bold")
 
     def update(frame):
@@ -202,18 +264,34 @@ def make_problem1():
 
         draw_track(ax)
 
+        # Draw matched measurements + association lines
+        n_matched   = 0
+        n_unmatched = 0
         if len(sol._global_meas) > 0:
-            for idx, gm in zip(sol._assoc, sol._global_meas):
-                mc = MAP_CONES[idx]
-                ax.plot([gm[0], mc[0]], [gm[1], mc[1]],
-                        "g--", lw=1.0, alpha=0.65, zorder=3)
-            ax.scatter(sol._global_meas[:, 0], sol._global_meas[:, 1],
-                       c="cyan", s=45, zorder=5,
-                       label=f"Measurements ({len(sol._global_meas)})")
+            for i, (idx, gm) in enumerate(zip(sol._assoc, sol._global_meas)):
+                if idx >= 0:
+                    mc = MAP_CONES[idx]
+                    ax.plot([gm[0], mc[0]], [gm[1], mc[1]],
+                            "g--", lw=1.0, alpha=0.65, zorder=3)
+                    n_matched += 1
+
+            matched_mask = sol._assoc >= 0
+            if matched_mask.any():
+                ax.scatter(sol._global_meas[matched_mask, 0],
+                           sol._global_meas[matched_mask, 1],
+                           c="cyan", s=45, zorder=5,
+                           label=f"Matched ({matched_mask.sum()})")
+
+        # Draw unmatched / gated-out measurements in a distinct colour
+        if len(sol._unmatched_meas) > 0:
+            n_unmatched = len(sol._unmatched_meas)
+            ax.scatter(sol._unmatched_meas[:, 0], sol._unmatched_meas[:, 1],
+                       c="tomato", s=55, marker="x", zorder=6, linewidths=1.5,
+                       label=f"Gated out / new LM ({n_unmatched})")
 
         draw_car(ax, sol.pos, sol.heading)
         setup_ax(ax, f"Frame {frame+1}/{N_FRAMES}  –  "
-                     "green lines = NN association")
+                     "green = Hungarian match  |  red × = outside Mahalanobis gate")
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
