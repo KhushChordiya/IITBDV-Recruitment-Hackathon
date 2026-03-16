@@ -48,6 +48,13 @@ SPEED        = 7.0    # m/s
 LOOKAHEAD    = 5.5    # pure-pursuit lookahead distance (m)
 N_FRAMES     = 130    # ≈ one full lap
 
+# ── EKF Noise Parameters ──────────────────────────────────────────────────────
+# Process noise covariance Q  (how much we distrust the motion model)
+_Q = np.diag([0.05**2, 0.05**2, np.deg2rad(1.0)**2])
+
+# Observation noise covariance R  (range std=0.3 m, bearing std=3°)
+_R_OBS = np.diag([0.3**2, np.deg2rad(3.0)**2])
+
 
 # ── Utility Functions ─────────────────────────────────────────────────────────
 def angle_wrap(a: float) -> float:
@@ -143,59 +150,228 @@ class Bot:
 class Solution(Bot):
     def __init__(self):
         super().__init__()
-        self.learned_map  = []                    # list of np.ndarray (2,)
-        # Internal state exposed for visualisation
-        self._global_meas = np.zeros((0, 2))
-        self._assoc       = np.array([], dtype=int)
+        self.learned_map = []   # list of np.ndarray (2,)
+
+        # ── EKF state ────────────────────────────────────────────────
+        # mu: [x, y, heading]  (initialised from CAR_START_*)
+        self._mu = np.array([
+            float(CAR_START_POS[0]),
+            float(CAR_START_POS[1]),
+            float(CAR_START_HEADING),
+        ])
+        # P: 3×3 pose covariance (small initial uncertainty)
+        self._P  = np.diag([0.01, 0.01, np.deg2rad(1.0)**2])
+
+        # Exposed for visualisation: dead-reckoning shadow trail
+        self._dr_pos     = CAR_START_POS.copy()
+        self._dr_heading = CAR_START_HEADING
 
     # ------------------------------------------------------------------
-    def localization(self, velocity, steering):
+    def localization(self, velocity, steering,
+                     landmark_obs=None, known_landmarks=None):
         """
-        Bicycle kinematic model (dead reckoning):
-            ẋ = v·cos(ψ)
-            ẏ = v·sin(ψ)
-            ψ̇ = (v / L)·tan(δ)
+        EKF localization fusing bicycle-model dead-reckoning with
+        range-bearing observations to known landmarks.
+
+        Improvements over the baseline dead-reckoning
+        ----------------------------------------------
+        Dead-reckoning is open-loop: heading error integrates without
+        bound.  Even 0.5°/step bias drifts several metres per lap.
+        The EKF corrects continuously whenever a landmark observation
+        is available, keeping errors bounded while remaining real-time.
+
+        Predict step  (bicycle kinematic model – same equations as baseline)
+        ─────────────
+          x'  = x + v·cos(θ)·dt
+          y'  = y + v·sin(θ)·dt
+          θ'  = θ + (v/L)·tan(δ)·dt
+          P'  = F·P·Fᵀ + Q          (Jacobian F = ∂f/∂[x,y,θ])
+
+        Update step  (range-bearing observation model)
+        ───────────
+          range   = √((lm_x−x)² + (lm_y−y)²)
+          bearing = atan2(lm_y−y, lm_x−x) − θ
+          K = P·Hᵀ·(H·P·Hᵀ + R)⁻¹
+          μ ← μ + K·(z − ẑ)
+          P ← (I − K·H)·P
+
+        Parameters
+        ----------
+        velocity  : float – forward speed (m/s)
+        steering  : float – steering angle (rad)
+        landmark_obs    : list of (range, bearing, landmark_idx) – optional
+        known_landmarks : (L, 2) array of landmark positions in world frame
         """
-        self.pos[0]  += velocity * np.cos(self.heading) * DT
-        self.pos[1]  += velocity * np.sin(self.heading) * DT
-        self.heading  = angle_wrap(
-            self.heading + (velocity / WHEELBASE) * np.tan(steering) * DT
+        x, y, th = self._mu
+
+        # ── Also propagate a pure dead-reckoning shadow (for comparison) ──
+        self._dr_pos[0]  += velocity * np.cos(self._dr_heading) * DT
+        self._dr_pos[1]  += velocity * np.sin(self._dr_heading) * DT
+        self._dr_heading  = angle_wrap(
+            self._dr_heading + (velocity / WHEELBASE) * np.tan(steering) * DT
         )
+
+        # ── EKF Predict ───────────────────────────────────────────────
+        x_new  = x  + velocity * np.cos(th) * DT
+        y_new  = y  + velocity * np.sin(th) * DT
+        th_new = angle_wrap(
+            th + (velocity / WHEELBASE) * np.tan(steering) * DT
+        )
+
+        # Jacobian of motion model w.r.t. state [x, y, θ]
+        F = np.eye(3)
+        F[0, 2] = -velocity * np.sin(th) * DT
+        F[1, 2] =  velocity * np.cos(th) * DT
+
+        self._mu = np.array([x_new, y_new, th_new])
+        self._P  = F @ self._P @ F.T + _Q
+
+        # ── EKF Update (one update per associated landmark) ───────────
+        if landmark_obs and known_landmarks is not None:
+            for (r_meas, b_meas, lm_idx) in landmark_obs:
+                lm = known_landmarks[lm_idx]
+                self._ekf_update(r_meas, b_meas, lm)
+
+        # ── Sync pos / heading so the rest of the scaffold still works ─
+        self.pos     = self._mu[:2].copy()
+        self.heading = float(self._mu[2])
+
+    # ------------------------------------------------------------------
+    def _ekf_update(self, r_meas: float, b_meas: float,
+                    lm_pos: np.ndarray) -> None:
+        """Single EKF update for one range-bearing observation."""
+        x, y, th = self._mu
+        lm_x, lm_y = float(lm_pos[0]), float(lm_pos[1])
+
+        dx = lm_x - x
+        dy = lm_y - y
+        q  = dx**2 + dy**2
+        r  = np.sqrt(q)
+        if r < 1e-6:
+            return
+
+        # Predicted observation
+        z_pred = np.array([r, np.arctan2(dy, dx) - th])
+
+        # Observation Jacobian H = ∂h/∂[x, y, θ]
+        H = np.array([
+            [-dx / r,  -dy / r,  0.0],
+            [ dy / q,  -dx / q, -1.0],
+        ])
+
+        # Innovation (wrap bearing to [-π, π])
+        innov    = np.array([r_meas, b_meas]) - z_pred
+        innov[1] = angle_wrap(innov[1])
+
+        # Kalman gain and state/covariance update
+        S        = H @ self._P @ H.T + _R_OBS
+        K        = self._P @ H.T @ np.linalg.inv(S)
+        self._mu = self._mu + K @ innov
+        self._mu[2] = angle_wrap(self._mu[2])
+        self._P  = (np.eye(3) - K @ H) @ self._P
+
+    # ------------------------------------------------------------------
+    def _get_landmark_obs(self, measurements: np.ndarray) -> list:
+        """
+        Convert local-frame cone measurements into (range, bearing, idx)
+        tuples by matching each measurement to the nearest MAP_CONE entry.
+        Used internally to feed the EKF update without a full data-
+        association pipeline.
+        """
+        if len(measurements) == 0:
+            return []
+        obs = []
+        for local_pt in measurements:
+            r = float(np.linalg.norm(local_pt))
+            b = float(np.arctan2(local_pt[1], local_pt[0]))
+            # Find nearest cone in world frame
+            gm  = local_to_global(local_pt[None], self.pos, self.heading)[0]
+            idx = int(np.argmin(np.linalg.norm(MAP_CONES - gm, axis=1)))
+            obs.append((r, b, idx))
+        return obs
 
 
 # ── Problem 2 – Localization ───────────────────────────────────────────────────
 def make_problem2():
     """
-    Visualise dead-reckoning: the magenta trail is the car's estimated
-    trajectory built purely from the kinematic model and steering commands.
+    Side-by-side comparison of dead-reckoning vs EKF localization.
+
+    Magenta trail  = pure dead-reckoning shadow (open-loop, drifts over time)
+    Green  trail   = EKF-corrected pose (fuses motion model + cone observations)
+
+    The two paths start identically; divergence shows how much the EKF
+    corrections reduce accumulated heading and position error.
     """
-    sol     = Solution()
-    path_x  = [float(sol.pos[0])]
-    path_y  = [float(sol.pos[1])]
+    sol    = Solution()
+    # EKF path
+    ekf_x  = [float(sol.pos[0])]
+    ekf_y  = [float(sol.pos[1])]
+    # Dead-reckoning shadow path
+    dr_x   = [float(sol._dr_pos[0])]
+    dr_y   = [float(sol._dr_pos[1])]
+
     fig, ax = plt.subplots(figsize=(10, 7))
-    fig.suptitle("Problem 2 – Localization  (Dead Reckoning / Kinematic Model)",
-                 fontsize=13, fontweight="bold")
+    fig.suptitle(
+        "Problem 2 – Localization  (EKF: dead-reckoning + landmark observations)",
+        fontsize=13, fontweight="bold"
+    )
 
     def update(frame):
         ax.clear()
         steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        sol.localization(SPEED, steer)
-        path_x.append(float(sol.pos[0]))
-        path_y.append(float(sol.pos[1]))
+        meas  = get_measurements(sol.pos, sol.heading)
+
+        # Build range-bearing observations for the EKF update
+        obs = sol._get_landmark_obs(meas)
+        sol.localization(SPEED, steer,
+                         landmark_obs=obs, known_landmarks=MAP_CONES)
+
+        ekf_x.append(float(sol.pos[0]))
+        ekf_y.append(float(sol.pos[1]))
+        dr_x.append(float(sol._dr_pos[0]))
+        dr_y.append(float(sol._dr_pos[1]))
 
         draw_track(ax)
-        ax.plot(path_x, path_y, color="magenta", lw=2.0,
-                alpha=0.85, zorder=4, label="Dead-reckoning path")
+
+        # Dead-reckoning shadow
+        ax.plot(dr_x, dr_y, color="magenta", lw=1.5, alpha=0.6,
+                zorder=4, label="Dead-reckoning (baseline)", linestyle="--")
+
+        # EKF trajectory
+        ax.plot(ekf_x, ekf_y, color="limegreen", lw=2.2,
+                alpha=0.9, zorder=5, label="EKF trajectory (improved)")
+
+        # Uncertainty ellipse (1-σ from covariance)
+        _draw_cov_ellipse(ax, sol._mu[:2], sol._P[:2, :2])
+
         draw_car(ax, sol.pos, sol.heading)
         setup_ax(ax,
             f"Frame {frame+1}/{N_FRAMES}  –  "
-            f"pos=({sol.pos[0]:.1f}, {sol.pos[1]:.1f})  "
-            f"ψ={np.degrees(sol.heading):.1f}°")
+            f"EKF pos=({sol.pos[0]:.1f}, {sol.pos[1]:.1f})  "
+            f"ψ={np.degrees(sol.heading):.1f}°  "
+            f"|obs|={len(obs)}")
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
     return fig, ani
+
+
+def _draw_cov_ellipse(ax, mean: np.ndarray, cov2d: np.ndarray,
+                      n_std: float = 1.0, **kwargs) -> None:
+    """Draw a 1-σ uncertainty ellipse from a 2×2 covariance matrix."""
+    try:
+        vals, vecs = np.linalg.eigh(cov2d)
+        vals = np.maximum(vals, 0)          # numerical safety
+        w, h = 2 * n_std * np.sqrt(vals)
+        angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+        from matplotlib.patches import Ellipse
+        ell = Ellipse(xy=mean, width=w, height=h, angle=angle,
+                      edgecolor="limegreen", facecolor="none",
+                      lw=1.2, alpha=0.6, zorder=6)
+        ax.add_patch(ell)
+    except Exception:
+        pass   # silently skip if cov is degenerate
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -209,7 +385,7 @@ if __name__ == "__main__":
     print(f"  Centerline   : {len(CENTERLINE)} waypoints (clockwise)")
     print("\nOpening 1 animation window …")
 
-    # Keep references to prevent garbage collection of FuncAnimation objects.
     fig2, ani2 = make_problem2()
 
     plt.show()
+
